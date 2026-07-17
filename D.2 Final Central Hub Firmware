@@ -1,0 +1,544 @@
+==== PIN MAP ================================
+#define HUB_PUMP_RELAY_PIN   14   // D14: relay that switches pump power
+#define HUB_BATT_PIN         35   // D35: battery voltage only, no control logic
+#define HUB_BUZZER_PIN       26   // D26: buzzer
+#define HUB_WIFI_BUTTON_/*****************************************************************************************
+ * Smart Farming - Central Hub ESP32 Dev Module - FIXED LOGIC
+ *
+ * Correct hardware meaning:
+ *   D35 / GPIO35 = Battery voltage measurement only; uploaded to Sheet, no pump cutoff logic
+ *   D26 / GPIO26 = Buzzer, active HIGH
+ *   D14 / GPIO14 = Pump relay driver, active HIGH. This relay switches water pump power.
+ *
+ * Pump / Gate coordination:
+ *   - PUMP_ON command sent to ALL:
+ *       HUB1 turns pump relay ON
+ *       NODE1 opens water gate
+ *   - PUMP_OFF command sent to ALL:
+ *       HUB1 turns pump relay OFF
+ *       NODE1 closes water gate
+ *
+ * Safety:
+ *   - Hub still blocks pump if latest node methane is unsafe.
+ *   - In MANUAL mode, node stale/no node data does not block manual pump command.
+ *   - In AUTO/SCHEDULE, hub needs fresh node moisture data.
+ *****************************************************************************************/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <time.h>
+
+// ============================ USER CONFIG ============================
+const char* WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxWyU85u4DvYFKfd6v0TjzV2EaYNkwdV5Ll9rKJzAaTc1-6unhbtwaG7lUO_aM6XYwk/exec";
+const char* API_KEY    = "CHANGE_ME_SMART_FARMING_KEY";
+const char* DEVICE_ID  = "HUB1";
+const char* AP_NAME    = "Smart Farming Hub";
+const char* AP_PASS    = "12345678";
+
+// ========================PIN  25   // Optional WiFi portal button to GND
+
+// ============================ TIMING =================================
+const uint32_t POLL_INTERVAL_MS       = 30000;
+const uint32_t UPLOAD_INTERVAL_MS     = 60000;
+const uint32_t WIFI_RETRY_MS          = 20000;
+const uint32_t WIFI_BUTTON_HOLD_MS    = 3000;
+const uint32_t STATUS_PRINT_MS        = 5000;
+
+// ============================ STRUCTS ================================
+enum Mode : uint8_t { MODE_MANUAL = 0, MODE_AUTO = 1, MODE_SCHEDULE = 2 };
+
+struct Settings {
+  Mode mode = MODE_AUTO;
+  float maxMethane = 600;
+  float minMoisture = 35;
+  float maxMoisture = 70;
+  uint32_t staleSec = 150;
+};
+
+Settings cfg;
+
+struct NodeLatest {
+  bool valid = false;
+  uint32_t localReceivedMs = 0;
+  float methane = NAN;
+  float moisture = NAN;
+  float batt = NAN;
+  int gate = 0;
+  int cloudAgeSec = 99999;
+};
+
+NodeLatest node;
+
+struct ScheduleCycle {
+  char id[16] = "";
+  bool enabled = false;
+  char startDate[11] = "";
+  char endDate[11] = "";
+  char startTime[6] = "06:30";
+  uint16_t durationMin = 0;
+  float minMoisture = 35;
+  float maxMoisture = 70;
+};
+
+ScheduleCycle schedules[8];
+uint8_t scheduleCount = 0;
+
+// ============================ GLOBALS ================================
+Preferences prefs;
+uint32_t lastPollMs = 0;
+uint32_t lastUploadMs = 0;
+uint32_t lastWiFiTryMs = 0;
+uint32_t lastPrintMs = 0;
+
+String lastCommandId = "";
+bool pumpOn = false;
+bool manualPumpRequest = false;
+float hubBatt = 0;
+String safetyLock = "BOOT";
+String activeCycle = "";
+
+// ============================ UTILS ==================================
+String modeName(Mode m) {
+  if (m == MODE_MANUAL) return "MANUAL";
+  if (m == MODE_SCHEDULE) return "SCHEDULE";
+  return "AUTO";
+}
+
+Mode parseMode(const String& s) {
+  String x = s;
+  x.toUpperCase();
+  if (x == "MANUAL") return MODE_MANUAL;
+  if (x == "SCHEDULE") return MODE_SCHEDULE;
+  return MODE_AUTO;
+}
+
+void beep(uint16_t ms = 80) {
+  digitalWrite(HUB_BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(HUB_BUZZER_PIN, LOW);
+}
+
+String urlEncode(const String& s) {
+  String out;
+  const char* hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += c;
+    else {
+      out += '%';
+      out += hex[(c >> 4) & 0x0F];
+      out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
+String httpGET(const String& url, uint16_t timeoutMs = 12000) {
+  if (WiFi.status() != WL_CONNECTED) return "";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(timeoutMs);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, url)) return "";
+
+  int code = http.GET();
+  String payload = "";
+  if (code > 0) payload = http.getString();
+
+  Serial.printf("[HTTP] code=%d len=%d\n", code, payload.length());
+  http.end();
+  return payload;
+}
+
+float batteryVoltage() {
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; i++) {
+    mv += analogReadMilliVolts(HUB_BATT_PIN);
+    delay(2);
+  }
+  float adcV = (mv / 8.0f) / 1000.0f;
+  return adcV * 2.0f; // R1=R2=100k divider
+}
+
+void setPump(bool on) {
+  pumpOn = on;
+  digitalWrite(HUB_PUMP_RELAY_PIN, on ? HIGH : LOW);
+}
+
+// ============================ LOCAL SAVE =============================
+void saveLocal() {
+  prefs.begin("farmHub", false);
+  prefs.putBytes("settings", &cfg, sizeof(cfg));
+  prefs.putUChar("mode", (uint8_t)cfg.mode);
+  prefs.putBool("manualPump", manualPumpRequest);
+  prefs.end();
+}
+
+void loadLocal() {
+  prefs.begin("farmHub", true);
+  if (prefs.getBytesLength("settings") == sizeof(cfg)) prefs.getBytes("settings", &cfg, sizeof(cfg));
+  cfg.mode = (Mode)prefs.getUChar("mode", (uint8_t)cfg.mode);
+  manualPumpRequest = prefs.getBool("manualPump", false);
+  prefs.end();
+}
+
+// ============================ WIFI ===================================
+void connectWiFiNonBlocking() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - lastWiFiTryMs < WIFI_RETRY_MS) return;
+
+  lastWiFiTryMs = millis();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  Serial.println("[WiFi] reconnect attempt");
+}
+
+void startWiFiPortal() {
+  Serial.println("[WiFi] Starting config portal. AP: Smart Farming Hub / 12345678");
+  beep(100); delay(80); beep(100);
+
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  bool ok = wm.startConfigPortal(AP_NAME, AP_PASS);
+
+  Serial.println(ok ? "[WiFi] configured" : "[WiFi] portal timeout");
+  if (ok) {
+    configTime(6 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    beep(300);
+  }
+}
+
+void handleWiFiButton() {
+  static uint32_t pressedAt = 0;
+  static bool portalStarted = false;
+
+  bool pressed = digitalRead(HUB_WIFI_BUTTON_PIN) == LOW;
+  if (pressed && pressedAt == 0) pressedAt = millis();
+  if (!pressed) { pressedAt = 0; portalStarted = false; }
+
+  if (pressed && !portalStarted && millis() - pressedAt >= WIFI_BUTTON_HOLD_MS) {
+    portalStarted = true;
+    setPump(false);
+    startWiFiPortal();
+  }
+}
+
+// ============================ JSON APPLY =============================
+void applySettings(JsonObject s) {
+  if (s.isNull()) return;
+
+  if (s["MODE"].is<const char*>()) cfg.mode = parseMode(String((const char*)s["MODE"]));
+  if (s["MAX_METHANE"].is<float>()) cfg.maxMethane = s["MAX_METHANE"];
+  if (s["MIN_MOISTURE"].is<float>()) cfg.minMoisture = s["MIN_MOISTURE"];
+  if (s["MAX_MOISTURE"].is<float>()) cfg.maxMoisture = s["MAX_MOISTURE"];
+  if (s["NODE_DATA_STALE_SEC"].is<uint32_t>()) cfg.staleSec = s["NODE_DATA_STALE_SEC"];
+}
+
+void applySchedule(JsonArray arr) {
+  scheduleCount = 0;
+
+  for (JsonObject o : arr) {
+    if (scheduleCount >= 8) break;
+
+    ScheduleCycle& c = schedules[scheduleCount++];
+    memset(&c, 0, sizeof(c));
+
+    strlcpy(c.id, o["id"] | "Cycle", sizeof(c.id));
+    c.enabled = o["enabled"] | false;
+    strlcpy(c.startDate, o["startDate"] | "", sizeof(c.startDate));
+    strlcpy(c.endDate, o["endDate"] | "", sizeof(c.endDate));
+    strlcpy(c.startTime, o["startTime"] | "06:30", sizeof(c.startTime));
+    c.durationMin = o["durationMin"] | 0;
+    c.minMoisture = o["minMoisture"] | cfg.minMoisture;
+    c.maxMoisture = o["maxMoisture"] | cfg.maxMoisture;
+  }
+}
+
+void applyLatestNode(JsonObject n) {
+  if (n.isNull()) return;
+
+  node.valid = true;
+  node.localReceivedMs = millis();
+  node.cloudAgeSec = n["ageSec"] | 99999;
+  node.methane = n["methane"] | NAN;
+  node.moisture = n["moisture"] | NAN;
+  node.batt = n["batt"] | NAN;
+  node.gate = n["gate"] | 0;
+}
+
+void acknowledgeCommand(const String& id) {
+  if (id.length() == 0) return;
+
+  String url = String(WEBAPP_URL)
+             + "?api=1&action=ackCommand&key=" + urlEncode(API_KEY)
+             + "&id=" + urlEncode(id)
+             + "&target=" + urlEncode(DEVICE_ID);
+
+  httpGET(url, 8000);
+}
+
+void processCommand(JsonObject cmd) {
+  if (cmd.isNull()) return;
+
+  String id = cmd["id"] | "";
+  String c = cmd["cmd"] | "";
+  c.toUpperCase();
+
+  if (id.length() && id == lastCommandId) return;
+
+  Serial.printf("[CMD] id=%s cmd=%s target=%s\n", id.c_str(), c.c_str(), String(cmd["target"] | "").c_str());
+
+  bool processed = true;
+
+  if (c == "PUMP_ON") {
+    cfg.mode = MODE_MANUAL;
+    manualPumpRequest = true;
+    setPump(true);
+  }
+  else if (c == "PUMP_OFF") {
+    cfg.mode = MODE_MANUAL;
+    manualPumpRequest = false;
+    setPump(false);
+  }
+  else if (c == "BUZZER_TEST") {
+    beep(300);
+  }
+  else if (c == "SET_MODE") {
+    cfg.mode = parseMode(String(cmd["value"] | "AUTO"));
+    if (cfg.mode != MODE_MANUAL) manualPumpRequest = false;
+  }
+  else {
+    processed = false;
+  }
+
+  if (processed) {
+    lastCommandId = id;
+    saveLocal();
+    acknowledgeCommand(id);
+  }
+}
+
+void pollCloud() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = String(WEBAPP_URL)
+             + "?api=1&action=poll&key=" + urlEncode(API_KEY)
+             + "&target=HUB1&lastCommandId=" + urlEncode(lastCommandId);
+
+  String payload = httpGET(url, 15000);
+  if (payload.length() < 10) return;
+
+  DynamicJsonDocument doc(18000);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[JSON] poll parse fail: %s\n", err.c_str());
+    return;
+  }
+
+  if (!doc["ok"].as<bool>()) return;
+
+  applySettings(doc["settings"].as<JsonObject>());
+  applySchedule(doc["schedule"].as<JsonArray>());
+  applyLatestNode(doc["latestNode"].as<JsonObject>());
+  processCommand(doc["command"].as<JsonObject>());
+  saveLocal();
+}
+
+// ============================ SCHEDULE ===============================
+bool validTime(struct tm& t) {
+  return getLocalTime(&t, 50) && t.tm_year > 120;
+}
+
+int ymdInt(const char* d) {
+  if (!d || strlen(d) < 10) return 0;
+  int y = atoi(String(d).substring(0, 4).c_str());
+  int m = atoi(String(d).substring(5, 7).c_str());
+  int day = atoi(String(d).substring(8, 10).c_str());
+  return y * 10000 + m * 100 + day;
+}
+
+int timeMin(const char* t) {
+  if (!t || strlen(t) < 5) return -1;
+  return atoi(String(t).substring(0, 2).c_str()) * 60
+       + atoi(String(t).substring(3, 5).c_str());
+}
+
+ScheduleCycle* activeScheduleCycle() {
+  struct tm now;
+  if (!validTime(now)) return nullptr;
+
+  int today = (now.tm_year + 1900) * 10000
+            + (now.tm_mon + 1) * 100
+            + now.tm_mday;
+  int curMin = now.tm_hour * 60 + now.tm_min;
+
+  for (uint8_t i = 0; i < scheduleCount; i++) {
+    ScheduleCycle& c = schedules[i];
+    if (!c.enabled) continue;
+
+    int sd = ymdInt(c.startDate);
+    int ed = ymdInt(c.endDate);
+    int st = timeMin(c.startTime);
+
+    if (!sd || !ed || st < 0 || c.durationMin == 0) continue;
+
+    if (today >= sd && today <= ed && curMin >= st && curMin < st + c.durationMin) {
+      return &c;
+    }
+  }
+
+  return nullptr;
+}
+
+// ============================ CONTROL ================================
+uint32_t nodeAgeSecLocal() {
+  if (!node.valid) return 99999;
+  uint32_t localAge = (millis() - node.localReceivedMs) / 1000;
+  return max((uint32_t)node.cloudAgeSec, localAge);
+}
+
+bool methaneUnsafe() {
+  return node.valid && !isnan(node.methane) && node.methane >= cfg.maxMethane;
+}
+
+bool nodeStale() {
+  return nodeAgeSecLocal() > cfg.staleSec;
+}
+
+void controlLogic() {
+  hubBatt = batteryVoltage(); // report only
+
+  if (methaneUnsafe()) {
+    setPump(false);
+    safetyLock = "METHANE LOCK";
+    return;
+  }
+
+  safetyLock = "OK";
+  activeCycle = "";
+
+  if (cfg.mode == MODE_MANUAL) {
+    setPump(manualPumpRequest);
+    return;
+  }
+
+  if (nodeStale()) {
+    setPump(false);
+    safetyLock = "NODE STALE";
+    return;
+  }
+
+  if (!node.valid || isnan(node.moisture)) {
+    setPump(false);
+    safetyLock = "NO NODE DATA";
+    return;
+  }
+
+  if (cfg.mode == MODE_AUTO) {
+    if (node.moisture <= cfg.minMoisture) setPump(true);
+    else if (node.moisture >= cfg.maxMoisture) setPump(false);
+  }
+  else if (cfg.mode == MODE_SCHEDULE) {
+    ScheduleCycle* c = activeScheduleCycle();
+    if (c) {
+      activeCycle = String(c->id);
+      if (node.moisture < c->maxMoisture) setPump(true);
+      else setPump(false);
+    } else {
+      setPump(false);
+    }
+  }
+}
+
+void uploadHub() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = String(WEBAPP_URL) + "?api=1&action=uploadHub&key=" + urlEncode(API_KEY);
+  url += "&device=" + urlEncode(DEVICE_ID);
+  url += "&pump=" + String(pumpOn ? 1 : 0);
+  url += "&relay=" + String(pumpOn ? 1 : 0); // relay state = pump relay state
+  url += "&batt=" + String(hubBatt, 2);
+  url += "&mode=" + modeName(cfg.mode);
+  url += "&cycle=" + urlEncode(activeCycle);
+  url += "&safety=" + urlEncode(safetyLock);
+  url += "&nodeAge=" + String(nodeAgeSecLocal());
+  url += "&rssi=" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+  url += "&status=" + urlEncode(String("Hub running"));
+
+  String res = httpGET(url, 15000);
+  Serial.println(res);
+}
+
+void printStatus() {
+  if (millis() - lastPrintMs < STATUS_PRINT_MS) return;
+  lastPrintMs = millis();
+
+  Serial.printf("[HUB] WiFi=%s Batt=%.2fV PumpRelay=%d Mode=%s Safety=%s NodeAge=%lus Methane=%.1f Moist=%.1f ManualPump=%d\n",
+    WiFi.status() == WL_CONNECTED ? "OK" : "OFF",
+    hubBatt,
+    pumpOn,
+    modeName(cfg.mode).c_str(),
+    safetyLock.c_str(),
+    (unsigned long)nodeAgeSecLocal(),
+    node.methane,
+    node.moisture,
+    manualPumpRequest
+  );
+}
+
+// ============================ SETUP / LOOP ===========================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("\n=== Smart Farming Central Hub FIXED ===");
+
+  pinMode(HUB_PUMP_RELAY_PIN, OUTPUT);
+  pinMode(HUB_BUZZER_PIN, OUTPUT);
+  pinMode(HUB_WIFI_BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(HUB_PUMP_RELAY_PIN, LOW);
+  digitalWrite(HUB_BUZZER_PIN, LOW);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(HUB_BATT_PIN, ADC_11db);
+
+  loadLocal();
+  hubBatt = batteryVoltage();
+  setPump(false);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  configTime(6 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  beep(80);
+}
+
+void loop() {
+  handleWiFiButton();
+  connectWiFiNonBlocking();
+
+  if (millis() - lastPollMs >= POLL_INTERVAL_MS) {
+    lastPollMs = millis();
+    pollCloud();
+  }
+
+  controlLogic();
+
+  if (millis() - lastUploadMs >= UPLOAD_INTERVAL_MS) {
+    lastUploadMs = millis();
+    uploadHub();
+  }
+
+  printStatus();
+  delay(20);
+}
