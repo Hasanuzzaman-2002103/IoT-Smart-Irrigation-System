@@ -1,0 +1,1533 @@
+/**************************************************************
+ * Smart Farming - Google Apps Script Web App
+ * Modified version: Motor Log + Motor Flow Rate + Soil Calibration
+ *
+ * ESP SIDE COMPATIBILITY:
+ * - uploadNode, uploadHub, poll, ackCommand URLs remain compatible.
+ * - ESP firmware does not need to be changed.
+ * - Soil calibration is dashboard/backend only.
+ * - Motor log is calculated from Hub pump-state uploads.
+ **************************************************************/
+
+const APP_TITLE = 'Smart Farming';
+const DEFAULT_API_KEY = 'CHANGE_ME_SMART_FARMING_KEY';
+
+const TABS = {
+  NODE: 'NodeData',
+  HUB: 'HubData',
+  SETTINGS: 'Settings',
+  COMMAND: 'Command',
+  CALIB: 'GasCalibration',
+  SOIL_CALIB: 'SoilCalibration',
+  MOTOR_LOG: 'MotorLog',
+  SCHEDULE: 'Schedule',
+  CROP: 'CropSetValues'
+};
+
+const DEVICE_SETTING_KEYS = [
+  'MODE',
+  'MAX_METHANE',
+  'MAX_CO',
+  'MAX_CO2',
+  'MIN_MOISTURE',
+  'MAX_MOISTURE',
+  'MIN_TEMP',
+  'MAX_TEMP',
+  'NODE_RELAY_OFF_V',
+  'NODE_RELAY_ON_V',
+  'HUB_RELAY_OFF_V',
+  'HUB_RELAY_ON_V',
+  'NODE_DATA_STALE_SEC',
+  'SCHEDULE_ENABLED'
+];
+
+const GAS_SENSOR_LABELS = {
+  MQ4: 'Methane Level',
+  MQ9: 'Carbon Monoxide Level',
+  MQ135: 'Carbon Dioxide / Air Quality'
+};
+
+const SOIL_PARAMETERS = [
+  { key: 'MOISTURE', label: 'Soil Moisture', unit: '%', points: 10 },
+  { key: 'N', label: 'Nitrogen', unit: 'mg/kg', points: 5 },
+  { key: 'P', label: 'Phosphorus', unit: 'mg/kg', points: 5 },
+  { key: 'K', label: 'Potassium', unit: 'mg/kg', points: 5 },
+  { key: 'PH', label: 'Soil pH', unit: 'pH', points: 5 }
+];
+
+function getApiKey_() {
+  return PropertiesService.getScriptProperties().getProperty('API_KEY') || DEFAULT_API_KEY;
+}
+
+function doGet(e) {
+  e = e || { parameter: {} };
+  const p = e.parameter || {};
+
+  if (p.api === '1') return handleApi_(p);
+
+  return HtmlService.createTemplateFromFile('index')
+    .evaluate()
+    .setTitle(APP_TITLE)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+function handleApi_(p) {
+  try {
+    const action = String(p.action || '').trim();
+
+    if (action !== 'setup' && String(p.key || '') !== getApiKey_()) {
+      return json_({ ok: false, error: 'Bad API key' });
+    }
+
+    setupSheets_();
+
+    switch (action) {
+      case 'setup':
+        return json_({ ok: true, message: 'Sheets ready', apiKeyHint: getApiKey_() });
+
+      case 'uploadNode':
+        return uploadNode_(p);
+
+      case 'uploadHub':
+        return uploadHub_(p);
+
+      case 'poll':
+        return poll_(p);
+
+      case 'ackCommand':
+        return ackCommand_(p);
+
+      case 'saveSettings':
+        return saveSettingsFromDevice_(p);
+
+      case 'saveCalibrationPoint':
+        return saveCalibrationPointFromDevice_(p);
+
+      default:
+        return json_({ ok: false, error: 'Unknown action: ' + action });
+    }
+  } catch (err) {
+    return json_({
+      ok: false,
+      error: String(err),
+      stack: err && err.stack ? String(err.stack) : ''
+    });
+  }
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function ss_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('Open this script from the Smart Farming Google Sheet, or bind it to that Sheet.');
+  return ss;
+}
+
+function sh_(name) {
+  return ss_().getSheetByName(name) || ss_().insertSheet(name);
+}
+
+/********************* SHEET SETUP *********************/
+
+function setupSheets_() {
+  initSheet_(TABS.NODE, [
+    'Timestamp',
+    'Device ID',
+    'Methane Level',
+    'CO Level',
+    'CO2 Equivalent',
+    'Air Temp',
+    'Humidity',
+    'Soil Moisture',
+    'Soil Temp',
+    'EC',
+    'pH',
+    'N',
+    'P',
+    'K',
+    'Battery Voltage',
+    'Gate Position',
+    'Relay State',
+    'Fan State',
+    'WiFi RSSI',
+    'Status'
+  ]);
+
+  initSheet_(TABS.HUB, [
+    'Timestamp',
+    'Device ID',
+    'Pump State',
+    'Relay State',
+    'Battery Voltage',
+    'Mode',
+    'Active Cycle',
+    'Safety Lock',
+    'Last Node Data Age Sec',
+    'WiFi RSSI',
+    'Status'
+  ]);
+
+  initSheet_(TABS.SETTINGS, ['Key', 'Value', 'Updated At']);
+  seedSettings_();
+
+  initSheet_(TABS.COMMAND, [
+    'Command JSON',
+    'Last Updated',
+    'Last Ack ID',
+    'Last Ack Time'
+  ]);
+
+  const cmd = sh_(TABS.COMMAND);
+  if (cmd.getLastRow() < 2) cmd.getRange(2, 1, 1, 4).setValues([['', '', '', '']]);
+  if (cmd.getLastRow() < 3) cmd.getRange(3, 1, 1, 4).setValues([['', '', '', '']]);
+
+  initSheet_(TABS.CALIB, [
+    'Sensor',
+    'PointIndex',
+    'RawValue',
+    'PPMValue',
+    'Updated At'
+  ]);
+  seedGasCalibration_();
+
+  initSheet_(TABS.SOIL_CALIB, [
+    'Parameter',
+    'PointIndex',
+    'SensorValue',
+    'ActualValue',
+    'Unit',
+    'Updated At'
+  ]);
+  seedSoilCalibration_();
+
+  initSheet_(TABS.MOTOR_LOG, [
+    'Date',
+    'Motor Start Time',
+    'Motor Stop Time',
+    'Interval Minute',
+    'Motor Flow Rate (L/min)',
+    'Water Used (L)',
+    'System Mode',
+    'Active Cycle',
+    'Safety Lock',
+    'Status'
+  ]);
+
+  initSheet_(TABS.SCHEDULE, [
+    'Cycle ID',
+    'Enabled',
+    'Start Date',
+    'End Date',
+    'Start Time',
+    'Duration Minute',
+    'Min Moisture',
+    'Max Moisture',
+    'Updated At'
+  ]);
+  seedSchedule_();
+
+  initSheet_(TABS.CROP, [
+    'Crop',
+    'N',
+    'P',
+    'K',
+    'pH',
+    'EC',
+    'Moisture',
+    'Soil Temp',
+    'Updated At'
+  ]);
+  seedCrop_();
+}
+
+function initSheet_(name, header) {
+  const sh = sh_(name);
+
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(header);
+  } else {
+    sh.getRange(1, 1, 1, header.length).setValues([header]);
+  }
+
+  sh.setFrozenRows(1);
+}
+
+function seedSettings_() {
+  const defaults = {
+    MODE: 'AUTO',
+    MAX_METHANE: 600,
+    MAX_CO: 400,
+    MAX_CO2: 1000,
+    MIN_MOISTURE: 35,
+    MAX_MOISTURE: 70,
+    MIN_TEMP: 15,
+    MAX_TEMP: 40,
+
+    NODE_RELAY_OFF_V: 5.8,
+    NODE_RELAY_ON_V: 5.8,
+    HUB_RELAY_OFF_V: 5.8,
+    HUB_RELAY_ON_V: 5.8,
+
+    NODE_DATA_STALE_SEC: 150,
+    SCHEDULE_ENABLED: 'TRUE',
+
+    MOTOR_FLOW_RATE_LPM: 1.0
+  };
+
+  const sh = sh_(TABS.SETTINGS);
+  const existing = settingsMap_();
+
+  Object.keys(defaults).forEach(k => {
+    if (!(k in existing)) {
+      sh.appendRow([k, defaults[k], new Date()]);
+    }
+  });
+}
+
+function seedGasCalibration_() {
+  const sh = sh_(TABS.CALIB);
+  if (sh.getLastRow() > 1) return;
+
+  const rows = [];
+  const sensors = ['MQ4', 'MQ9', 'MQ135'];
+
+  sensors.forEach(sensor => {
+    for (let point = 1; point <= 5; point++) {
+      rows.push([sensor, point, '', '', new Date()]);
+    }
+  });
+
+  if (rows.length) sh.getRange(2, 1, rows.length, 5).setValues(rows);
+}
+
+function seedSoilCalibration_() {
+  const sh = sh_(TABS.SOIL_CALIB);
+  if (sh.getLastRow() > 1) return;
+
+  const rows = [];
+
+  SOIL_PARAMETERS.forEach(param => {
+    for (let point = 1; point <= param.points; point++) {
+      rows.push([
+        param.key,
+        point,
+        '',
+        '',
+        param.unit,
+        new Date()
+      ]);
+    }
+  });
+
+  if (rows.length) sh.getRange(2, 1, rows.length, 6).setValues(rows);
+}
+
+function seedSchedule_() {
+  const sh = sh_(TABS.SCHEDULE);
+  if (sh.getLastRow() > 1) return;
+
+  sh.appendRow([
+    'Cycle-1',
+    false,
+    '',
+    '',
+    '06:30',
+    20,
+    35,
+    70,
+    new Date()
+  ]);
+}
+
+function seedCrop_() {
+  const sh = sh_(TABS.CROP);
+  if (sh.getLastRow() > 1) return;
+
+  sh.appendRow(['Rice', 90, 40, 40, 6.5, 1200, 70, 28, new Date()]);
+  sh.appendRow(['Potato', 120, 60, 150, 5.8, 1000, 60, 22, new Date()]);
+  sh.appendRow(['Tomato', 150, 70, 200, 6.2, 1500, 65, 25, new Date()]);
+}
+
+/********************* ESP API FUNCTIONS *********************/
+
+function uploadNode_(p) {
+  const row = [
+    new Date(),
+    p.device || 'NODE1',
+    num_(p.methane),
+    num_(p.co),
+    num_(p.co2),
+    num_(p.airTemp),
+    num_(p.humidity),
+    num_(p.moisture),
+    num_(p.soilTemp),
+    num_(p.ec),
+    num_(p.ph),
+    num_(p.n),
+    num_(p.p),
+    num_(p.k),
+    num_(p.batt),
+    num_(p.gate),
+    boolText_(p.relay),
+    boolText_(p.fan),
+    num_(p.rssi),
+    p.status || ''
+  ];
+
+  sh_(TABS.NODE).appendRow(row);
+
+  return json_({
+    ok: true,
+    message: 'Node data saved',
+    timestamp: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss')
+  });
+}
+
+function uploadHub_(p) {
+  const now = new Date();
+  const pumpOn = boolValue_(p.pump);
+  const mode = String(p.mode || '').toUpperCase() || 'UNKNOWN';
+  const activeCycle = p.cycle || '';
+  const safety = p.safety || '';
+  const status = p.status || '';
+
+  const row = [
+    now,
+    p.device || 'HUB1',
+    boolText_(p.pump),
+    boolText_(p.relay),
+    num_(p.batt),
+    mode,
+    activeCycle,
+    safety,
+    num_(p.nodeAge),
+    num_(p.rssi),
+    status
+  ];
+
+  sh_(TABS.HUB).appendRow(row);
+
+  updateMotorLog_(now, pumpOn, mode, activeCycle, safety, status);
+
+  return json_({
+    ok: true,
+    message: 'Hub data saved',
+    timestamp: Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss')
+  });
+}
+
+function poll_(p) {
+  const target = String(p.target || '').toUpperCase();
+  const lastAck = String(p.lastCommandId || '');
+  const cmd = getCommandForTarget_(target);
+  const deliverCmd = shouldDeliverCommand_(cmd, target, lastAck) ? cmd : null;
+
+  return json_({
+    ok: true,
+    now: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'),
+    settings: deviceSettingsMap_(),
+    calibration: calibrationObject_(),
+    schedule: scheduleArray_(),
+    latestNode: latestNodeObject_(false),
+    command: deliverCmd
+  });
+}
+
+function commandTargets_(cmd) {
+  if (!cmd) return [];
+
+  if (Array.isArray(cmd.targets) && cmd.targets.length) {
+    return cmd.targets.map(t => String(t || '').toUpperCase()).filter(Boolean);
+  }
+
+  const t = String(cmd.target || 'ALL').toUpperCase();
+  if (t === 'ALL') return ['NODE1', 'HUB1'];
+
+  return [t];
+}
+
+function shouldDeliverCommand_(cmd, target, lastAck) {
+  if (!cmd || !cmd.id) return false;
+
+  target = String(target || '').toUpperCase();
+  if (!target) return false;
+  if (String(cmd.id) === lastAck) return false;
+
+  const targets = commandTargets_(cmd);
+  if (targets.indexOf(target) < 0) return false;
+
+  const ack = cmd.ack || {};
+  if (ack[target]) return false;
+
+  return true;
+}
+
+function commandRowForTarget_(target) {
+  target = String(target || '').toUpperCase();
+  if (target === 'HUB1') return 3;
+  return 2;
+}
+
+function getCommandFromRow_(row) {
+  const v = String(sh_(TABS.COMMAND).getRange(row, 1).getValue() || '').trim();
+
+  if (!v) return null;
+
+  try {
+    return JSON.parse(v);
+  } catch (err) {
+    return {
+      id: 'BAD_JSON',
+      target: 'NONE',
+      cmd: 'INVALID',
+      raw: v
+    };
+  }
+}
+
+function getCommandForTarget_(target) {
+  return getCommandFromRow_(commandRowForTarget_(target));
+}
+
+function getCommand_() {
+  return getCommandFromRow_(2);
+}
+
+function ackCommand_(p) {
+  const id = String(p.id || '').trim();
+  const target = String(p.target || '').trim().toUpperCase();
+  const sh = sh_(TABS.COMMAND);
+
+  let row = target ? commandRowForTarget_(target) : -1;
+  let cmd = row > 0 ? getCommandFromRow_(row) : null;
+
+  if ((!cmd || String(cmd.id) !== id) && !target) {
+    for (let r = 2; r <= 3; r++) {
+      const c = getCommandFromRow_(r);
+      if (c && String(c.id) === id) {
+        row = r;
+        cmd = c;
+        break;
+      }
+    }
+  }
+
+  if (row > 0) {
+    sh.getRange(row, 3).setValue(id);
+    sh.getRange(row, 4).setValue(new Date());
+  }
+
+  if (!cmd || String(cmd.id) !== id || row < 2) {
+    return json_({
+      ok: true,
+      cleared: false,
+      message: 'Command id did not match this device command row.'
+    });
+  }
+
+  sh.getRange(row, 1).setValue('');
+
+  return json_({
+    ok: true,
+    cleared: true,
+    row: row,
+    target: target
+  });
+}
+
+function saveSettingsFromDevice_(p) {
+  const allowed = DEVICE_SETTING_KEYS.concat(['MOTOR_FLOW_RATE_LPM']);
+  const obj = {};
+
+  allowed.forEach(k => {
+    if (p[k] !== undefined && String(p[k]).trim() !== '') {
+      obj[k] = p[k];
+    }
+  });
+
+  const result = saveSettings(obj);
+
+  return json_({
+    ok: true,
+    saved: obj,
+    settings: result.settings
+  });
+}
+
+function saveCalibrationPointFromDevice_(p) {
+  setupSheets_();
+
+  const sensor = String(p.sensor || '').trim().toUpperCase();
+  const point = Number(p.point || 0);
+  const raw = Number(p.raw);
+  const ppm = Number(p.ppm);
+
+  if (!['MQ4', 'MQ9', 'MQ135'].includes(sensor)) {
+    return json_({ ok: false, error: 'Invalid sensor: ' + sensor });
+  }
+
+  if (point < 1 || point > 5) {
+    return json_({ ok: false, error: 'Point must be 1 to 5' });
+  }
+
+  if (isNaN(raw) || isNaN(ppm)) {
+    return json_({ ok: false, error: 'Invalid raw or ppm value' });
+  }
+
+  const sh = sh_(TABS.CALIB);
+  const values = sh.getDataRange().getValues();
+  let targetRow = -1;
+
+  for (let i = 1; i < values.length; i++) {
+    const rowSensor = String(values[i][0] || '').trim().toUpperCase();
+    const rowPoint = Number(values[i][1] || 0);
+
+    if (rowSensor === sensor && rowPoint === point) {
+      targetRow = i + 1;
+      break;
+    }
+  }
+
+  const rowData = [sensor, point, raw, ppm, new Date()];
+
+  if (targetRow > 0) {
+    sh.getRange(targetRow, 1, 1, 5).setValues([rowData]);
+  } else {
+    sh.appendRow(rowData);
+  }
+
+  return json_({
+    ok: true,
+    saved: {
+      sensor: sensor,
+      point: point,
+      raw: raw,
+      ppm: ppm
+    },
+    calibration: calibrationObject_()
+  });
+}
+
+/********************* SETTINGS AND DATA HELPERS *********************/
+
+function settingsMap_() {
+  const sh = sh_(TABS.SETTINGS);
+  const values = sh.getDataRange().getValues();
+  const out = {};
+
+  for (let i = 1; i < values.length; i++) {
+    const k = String(values[i][0] || '').trim();
+    if (!k) continue;
+    out[k] = values[i][1];
+  }
+
+  return out;
+}
+
+function deviceSettingsMap_() {
+  const all = settingsMap_();
+  const out = {};
+
+  DEVICE_SETTING_KEYS.forEach(k => {
+    if (all[k] !== undefined) out[k] = all[k];
+  });
+
+  return out;
+}
+
+function calibrationObject_() {
+  const values = sh_(TABS.CALIB).getDataRange().getValues();
+  const out = {
+    MQ4: [],
+    MQ9: [],
+    MQ135: []
+  };
+
+  for (let i = 1; i < values.length; i++) {
+    const sensor = String(values[i][0] || '').toUpperCase();
+    const idx = Number(values[i][1]);
+    const raw = Number(values[i][2]);
+    const ppm = Number(values[i][3]);
+
+    if (out[sensor] && idx && !isNaN(raw) && !isNaN(ppm) && values[i][2] !== '' && values[i][3] !== '') {
+      out[sensor].push({
+        point: idx,
+        raw: raw,
+        ppm: ppm
+      });
+    }
+  }
+
+  Object.keys(out).forEach(k => out[k].sort((a, b) => a.raw - b.raw));
+
+  return out;
+}
+
+function soilCalibrationObject_() {
+  const values = sh_(TABS.SOIL_CALIB).getDataRange().getValues();
+  const out = {
+    MOISTURE: [],
+    N: [],
+    P: [],
+    K: [],
+    PH: []
+  };
+
+  for (let i = 1; i < values.length; i++) {
+    const param = normalizeSoilParam_(values[i][0]);
+    const idx = Number(values[i][1]);
+    const sensorValue = Number(values[i][2]);
+    const actualValue = Number(values[i][3]);
+
+    if (out[param] && idx && !isNaN(sensorValue) && !isNaN(actualValue) && values[i][2] !== '' && values[i][3] !== '') {
+      out[param].push({
+        point: idx,
+        sensor: sensorValue,
+        actual: actualValue
+      });
+    }
+  }
+
+  Object.keys(out).forEach(k => out[k].sort((a, b) => a.sensor - b.sensor));
+
+  return out;
+}
+
+function normalizeSoilParam_(v) {
+  const s = String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+  if (s === 'MOISTURE' || s === 'SOILMOISTURE' || s === 'MOIS') return 'MOISTURE';
+  if (s === 'N' || s === 'NITROGEN') return 'N';
+  if (s === 'P' || s === 'PHOSPHORUS' || s === 'PHOSPHOROUS') return 'P';
+  if (s === 'K' || s === 'POTASSIUM') return 'K';
+  if (s === 'PH' || s === 'SOILPH') return 'PH';
+
+  return s;
+}
+
+function applyCalibration_(param, rawValue, calib) {
+  const raw = Number(rawValue);
+
+  if (isNaN(raw)) {
+    return {
+      value: '',
+      calibrated: false,
+      raw: rawValue
+    };
+  }
+
+  const key = normalizeSoilParam_(param);
+  const points = calib && calib[key] ? calib[key].slice().sort((a, b) => a.sensor - b.sensor) : [];
+
+  if (points.length < 2) {
+    return {
+      value: roundSmart_(raw),
+      calibrated: false,
+      raw: roundSmart_(raw)
+    };
+  }
+
+  if (raw <= points[0].sensor) {
+    return {
+      value: roundSmart_(points[0].actual),
+      calibrated: true,
+      raw: roundSmart_(raw)
+    };
+  }
+
+  const last = points[points.length - 1];
+
+  if (raw >= last.sensor) {
+    return {
+      value: roundSmart_(last.actual),
+      calibrated: true,
+      raw: roundSmart_(raw)
+    };
+  }
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+
+    if (raw >= a.sensor && raw <= b.sensor) {
+      if (b.sensor === a.sensor) {
+        return {
+          value: roundSmart_(a.actual),
+          calibrated: true,
+          raw: roundSmart_(raw)
+        };
+      }
+
+      const ratio = (raw - a.sensor) / (b.sensor - a.sensor);
+      const actual = a.actual + ratio * (b.actual - a.actual);
+
+      return {
+        value: roundSmart_(actual),
+        calibrated: true,
+        raw: roundSmart_(raw)
+      };
+    }
+  }
+
+  return {
+    value: roundSmart_(raw),
+    calibrated: false,
+    raw: roundSmart_(raw)
+  };
+}
+
+function roundSmart_(v) {
+  const n = Number(v);
+
+  if (isNaN(n)) return '';
+  if (Math.abs(n) >= 100) return Math.round(n * 10) / 10;
+
+  return Math.round(n * 100) / 100;
+}
+
+function scheduleArray_() {
+  const values = sh_(TABS.SCHEDULE).getDataRange().getValues();
+  const out = [];
+
+  for (let i = 1; i < values.length; i++) {
+    if (!values[i][0]) continue;
+
+    out.push({
+      id: String(values[i][0]),
+      enabled: String(values[i][1]).toUpperCase() === 'TRUE' || values[i][1] === true,
+      startDate: dateCell_(values[i][2]),
+      endDate: dateCell_(values[i][3]),
+      startTime: timeCell_(values[i][4]),
+      durationMin: Number(values[i][5] || 0),
+      minMoisture: Number(values[i][6] || 0),
+      maxMoisture: Number(values[i][7] || 0)
+    });
+  }
+
+  return out;
+}
+
+function latestNodeObject_(includeCalibration) {
+  const sh = sh_(TABS.NODE);
+  const last = sh.getLastRow();
+
+  if (last < 2) return null;
+
+  const row = sh.getRange(last, 1, 1, sh.getLastColumn()).getValues()[0];
+  const ts = row[0] instanceof Date ? row[0] : new Date(row[0]);
+  const ageSec = Math.round((Date.now() - ts.getTime()) / 1000);
+
+  const out = {
+    timestamp: Utilities.formatDate(ts, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'),
+    ageSec: ageSec,
+    device: row[1],
+    methane: row[2],
+    co: row[3],
+    co2: row[4],
+    airTemp: row[5],
+    humidity: row[6],
+    moisture: row[7],
+    soilTemp: row[8],
+    ec: row[9],
+    ph: row[10],
+    n: row[11],
+    p: row[12],
+    k: row[13],
+    batt: row[14],
+    gate: row[15],
+    relay: row[16],
+    fan: row[17],
+    rssi: row[18],
+    status: row[19]
+  };
+
+  if (includeCalibration !== false) {
+    addCalibratedFieldsToLatest_(out, soilCalibrationObject_());
+  }
+
+  return out;
+}
+
+function addCalibratedFieldsToLatest_(out, calib) {
+  const m = applyCalibration_('MOISTURE', out.moisture, calib);
+  const n = applyCalibration_('N', out.n, calib);
+  const p = applyCalibration_('P', out.p, calib);
+  const k = applyCalibration_('K', out.k, calib);
+  const ph = applyCalibration_('PH', out.ph, calib);
+
+  out.moistureCal = m.value;
+  out.moistureIsCalibrated = m.calibrated;
+
+  out.nCal = n.value;
+  out.nIsCalibrated = n.calibrated;
+
+  out.pCal = p.value;
+  out.pIsCalibrated = p.calibrated;
+
+  out.kCal = k.value;
+  out.kIsCalibrated = k.calibrated;
+
+  out.phCal = ph.value;
+  out.phIsCalibrated = ph.calibrated;
+}
+
+function enhanceNodeRowObject_(r, calib) {
+  const m = applyCalibration_('MOISTURE', r['Soil Moisture'], calib);
+  const n = applyCalibration_('N', r.N, calib);
+  const p = applyCalibration_('P', r.P, calib);
+  const k = applyCalibration_('K', r.K, calib);
+  const ph = applyCalibration_('PH', r.pH, calib);
+
+  r['Soil Moisture Display'] = m.value;
+  r['Soil Moisture Source'] = m.calibrated ? 'Calibrated' : 'Raw';
+
+  r['Nitrogen Display'] = n.value;
+  r['Nitrogen Source'] = n.calibrated ? 'Calibrated' : 'Raw';
+
+  r['Phosphorus Display'] = p.value;
+  r['Phosphorus Source'] = p.calibrated ? 'Calibrated' : 'Raw';
+
+  r['Potassium Display'] = k.value;
+  r['Potassium Source'] = k.calibrated ? 'Calibrated' : 'Raw';
+
+  r['pH Display'] = ph.value;
+  r['pH Source'] = ph.calibrated ? 'Calibrated' : 'Raw';
+
+  return r;
+}
+
+function num_(v) {
+  const n = Number(v);
+  return isNaN(n) ? '' : n;
+}
+
+function boolText_(v) {
+  if (v === true || String(v) === '1' || String(v).toUpperCase() === 'TRUE' || String(v).toUpperCase() === 'ON') return 'ON';
+  if (v === false || String(v) === '0' || String(v).toUpperCase() === 'FALSE' || String(v).toUpperCase() === 'OFF') return 'OFF';
+
+  return String(v || '');
+}
+
+function boolValue_(v) {
+  return v === true ||
+    String(v).toUpperCase() === 'TRUE' ||
+    String(v).toUpperCase() === 'ON' ||
+    String(v) === '1';
+}
+
+function dateCell_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return String(v || '');
+}
+
+function timeCell_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'HH:mm');
+  return String(v || '');
+}
+
+function dateTimeCell_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+  return String(v || '');
+}
+
+function timeMs_(v) {
+  if (v instanceof Date) return v.getTime();
+
+  const d = new Date(v);
+  const t = d.getTime();
+
+  return isNaN(t) ? 0 : t;
+}
+
+/********************* MOTOR LOG *********************/
+
+function updateMotorLog_(timestamp, pumpOn, mode, activeCycle, safety, status) {
+  const sh = sh_(TABS.MOTOR_LOG);
+  const openRow = findOpenMotorRow_(sh);
+  const settings = settingsMap_();
+  const flowRate = Number(settings.MOTOR_FLOW_RATE_LPM || 0);
+
+  if (pumpOn) {
+    if (!openRow) {
+      sh.appendRow([
+        Utilities.formatDate(timestamp, Session.getScriptTimeZone(), 'yyyy-MM-dd'),
+        timestamp,
+        '',
+        '',
+        roundSmart_(flowRate),
+        '',
+        mode || 'UNKNOWN',
+        activeCycle || '',
+        safety || '',
+        'RUNNING'
+      ]);
+    }
+    return;
+  }
+
+  if (!pumpOn && openRow) {
+    const startValue = sh.getRange(openRow, 2).getValue();
+    const startMs = timeMs_(startValue);
+    const stopMs = timestamp.getTime();
+    const intervalMin = startMs ? Math.max(0, (stopMs - startMs) / 60000) : 0;
+    const flowAtStart = Number(sh.getRange(openRow, 5).getValue() || flowRate || 0);
+    const waterUsed = intervalMin * flowAtStart;
+
+    sh.getRange(openRow, 3, 1, 8).setValues([[
+      timestamp,
+      roundSmart_(intervalMin),
+      roundSmart_(flowAtStart),
+      roundSmart_(waterUsed),
+      sh.getRange(openRow, 7).getValue() || mode || 'UNKNOWN',
+      activeCycle || sh.getRange(openRow, 8).getValue() || '',
+      safety || '',
+      status || 'STOPPED'
+    ]]);
+  }
+}
+
+function findOpenMotorRow_(sh) {
+  const last = sh.getLastRow();
+
+  if (last < 2) return 0;
+
+  const rows = sh.getRange(2, 1, last - 1, Math.max(10, sh.getLastColumn())).getValues();
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const start = rows[i][1];
+    const stop = rows[i][2];
+
+    if (start && !stop) return i + 2;
+  }
+
+  return 0;
+}
+
+function motorLogReport_(startDate, endDate, mode) {
+  const rows = rowsToObjects_(TABS.MOTOR_LOG);
+  const s = startDate ? new Date(startDate + 'T00:00:00').getTime() : 0;
+  const e = endDate ? new Date(endDate + 'T23:59:59').getTime() : Date.now();
+  const modeFilter = String(mode || 'ALL').toUpperCase();
+  const now = Date.now();
+  const settings = settingsMap_();
+  const fallbackFlow = Number(settings.MOTOR_FLOW_RATE_LPM || 0);
+
+  const filtered = rows.map(r => {
+    const startMs = timeMs_(r['Motor Start Time']);
+    const stopMs = timeMs_(r['Motor Stop Time']);
+    const flow = Number(r['Motor Flow Rate (L/min)'] || fallbackFlow || 0);
+
+    let interval = Number(r['Interval Minute']);
+    let water = Number(r['Water Used (L)']);
+
+    if ((!interval || isNaN(interval)) && startMs) {
+      interval = ((stopMs || now) - startMs) / 60000;
+    }
+
+    if ((!water || isNaN(water)) && interval && flow) {
+      water = interval * flow;
+    }
+
+    r['Interval Minute'] = roundSmart_(interval || 0);
+    r['Water Used (L)'] = roundSmart_(water || 0);
+    r['Motor Flow Rate (L/min)'] = roundSmart_(flow || 0);
+
+    if (!r['Motor Stop Time']) r.Status = 'RUNNING';
+
+    return r;
+  }).filter(r => {
+    const startMs = timeMs_(r['Motor Start Time']);
+
+    if (!startMs || startMs < s || startMs > e) return false;
+    if (modeFilter !== 'ALL' && String(r['System Mode'] || '').toUpperCase() !== modeFilter) return false;
+
+    return true;
+  });
+
+  const summary = filtered.reduce((acc, r) => {
+    acc.totalIntervalMin += Number(r['Interval Minute'] || 0);
+    acc.totalWaterUsedL += Number(r['Water Used (L)'] || 0);
+    acc.cycles += 1;
+    return acc;
+  }, {
+    totalIntervalMin: 0,
+    totalWaterUsedL: 0,
+    cycles: 0
+  });
+
+  summary.totalIntervalMin = roundSmart_(summary.totalIntervalMin);
+  summary.totalWaterUsedL = roundSmart_(summary.totalWaterUsedL);
+
+  return {
+    ok: true,
+    rows: filtered,
+    summary: summary
+  };
+}
+
+function getMotorLogReport(startDate, endDate, mode) {
+  setupSheets_();
+  return motorLogReport_(startDate, endDate, mode);
+}
+
+/********************* WEB APP FUNCTIONS CALLED BY index.html *********************/
+
+function setupSheets() {
+  setupSheets_();
+  return { ok: true };
+}
+
+function getDashboardData(days) {
+  setupSheets_();
+
+  days = Number(days || 1);
+
+  const since = Date.now() - days * 24 * 3600 * 1000;
+  const soilCalib = soilCalibrationObject_();
+
+  const nodeRows = rowsToObjects_(TABS.NODE)
+    .filter(r => new Date(r.Timestamp).getTime() >= since)
+    .slice(-300)
+    .map(r => enhanceNodeRowObject_(r, soilCalib));
+
+  const hubRows = rowsToObjects_(TABS.HUB)
+    .filter(r => new Date(r.Timestamp).getTime() >= since)
+    .slice(-300);
+
+  const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const motorToday = motorLogReport_(today, today, 'ALL').summary;
+
+  return {
+    ok: true,
+    settings: settingsMap_(),
+    latestNode: latestNodeObject_(),
+    nodeRows: nodeRows,
+    hubRows: hubRows,
+    schedules: scheduleArray_(),
+    crops: cropRows_(),
+    motorToday: motorToday,
+    gasLabels: GAS_SENSOR_LABELS,
+    soilParameters: SOIL_PARAMETERS
+  };
+}
+
+function rowsToObjects_(tab) {
+  const values = sh_(tab).getDataRange().getValues();
+
+  if (values.length < 2) return [];
+
+  const h = values[0];
+
+  return values.slice(1).filter(r => r.some(c => c !== '')).map(r => {
+    const o = {};
+
+    h.forEach((k, i) => {
+      let v = r[i];
+
+      if (v instanceof Date) {
+        v = Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+      }
+
+      o[k] = v;
+    });
+
+    return o;
+  });
+}
+
+function saveSettings(obj) {
+  setupSheets_();
+
+  obj = obj || {};
+
+  const sh = sh_(TABS.SETTINGS);
+  const values = sh.getDataRange().getValues();
+  const rowByKey = {};
+
+  for (let i = 1; i < values.length; i++) {
+    rowByKey[String(values[i][0])] = i + 1;
+  }
+
+  Object.keys(obj).forEach(k => {
+    if (rowByKey[k]) {
+      sh.getRange(rowByKey[k], 2, 1, 2).setValues([[obj[k], new Date()]]);
+    } else {
+      sh.appendRow([k, obj[k], new Date()]);
+    }
+  });
+
+  return {
+    ok: true,
+    settings: settingsMap_()
+  };
+}
+
+function writeCommandForTarget_(target, cmd) {
+  target = String(target || '').toUpperCase();
+
+  const row = commandRowForTarget_(target);
+  const c = Object.assign({}, cmd);
+
+  c.target = target;
+  c.targets = [target];
+  c.ack = {};
+
+  sh_(TABS.COMMAND).getRange(row, 1, 1, 2).setValues([
+    [JSON.stringify(c), new Date()]
+  ]);
+}
+
+function sendCommand(cmd) {
+  setupSheets_();
+
+  cmd = cmd || {};
+
+  if (!cmd.id) {
+    cmd.id = 'CMD_' +
+      Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmmss') +
+      '_' +
+      Math.floor(Math.random() * 1000);
+  }
+
+  cmd.cmd = String(cmd.cmd || '').toUpperCase();
+  cmd.target = String(cmd.target || 'ALL').toUpperCase();
+
+  if (cmd.target === 'ALL') {
+    writeCommandForTarget_('NODE1', cmd);
+    writeCommandForTarget_('HUB1', cmd);
+    cmd.targets = ['NODE1', 'HUB1'];
+  } else {
+    writeCommandForTarget_(cmd.target, cmd);
+    cmd.targets = [cmd.target];
+  }
+
+  cmd.ack = {};
+
+  return {
+    ok: true,
+    command: cmd
+  };
+}
+
+function saveCalibration(rows) {
+  setupSheets_();
+
+  rows = rows || [];
+
+  const sh = sh_(TABS.CALIB);
+
+  if (sh.getLastRow() > 1) {
+    sh.getRange(2, 1, Math.max(sh.getLastRow() - 1, 1), 5).clearContent();
+  }
+
+  const out = [];
+
+  rows.forEach(r => {
+    if (!r.sensor || !r.point) return;
+
+    out.push([
+      String(r.sensor).toUpperCase(),
+      Number(r.point),
+      r.raw === '' ? '' : Number(r.raw),
+      r.ppm === '' ? '' : Number(r.ppm),
+      new Date()
+    ]);
+  });
+
+  if (out.length) sh.getRange(2, 1, out.length, 5).setValues(out);
+
+  return {
+    ok: true,
+    calibration: calibrationObject_()
+  };
+}
+
+function getCalibrationRows() {
+  setupSheets_();
+  return rowsToObjects_(TABS.CALIB);
+}
+
+function cleanNumberOrBlank_(v) {
+  if (v === undefined || v === null || String(v).trim() === '') return '';
+
+  const n = Number(v);
+
+  return isNaN(n) ? '' : n;
+}
+
+function saveSoilCalibration(rows) {
+  setupSheets_();
+
+  rows = rows || [];
+
+  const sh = sh_(TABS.SOIL_CALIB);
+
+  if (sh.getLastRow() > 1) {
+    sh.getRange(2, 1, Math.max(sh.getLastRow() - 1, 1), 6).clearContent();
+  }
+
+  const out = [];
+
+  rows.forEach(r => {
+    const param = normalizeSoilParam_(r.parameter || r.Parameter);
+    if (!param) return;
+
+    const meta = SOIL_PARAMETERS.find(p => p.key === param) || { unit: '' };
+    const sensorInput = r.sensor !== undefined ? r.sensor : r.SensorValue;
+    const actualInput = r.actual !== undefined ? r.actual : r.ActualValue;
+
+    out.push([
+      param,
+      Number(r.point || r.PointIndex || 0),
+      cleanNumberOrBlank_(sensorInput),
+      cleanNumberOrBlank_(actualInput),
+      r.unit || r.Unit || meta.unit,
+      new Date()
+    ]);
+  });
+
+  if (out.length) sh.getRange(2, 1, out.length, 6).setValues(out);
+
+  return {
+    ok: true,
+    soilCalibration: soilCalibrationObject_()
+  };
+}
+
+function getSoilCalibrationRows() {
+  setupSheets_();
+  return rowsToObjects_(TABS.SOIL_CALIB);
+}
+
+function saveScheduleRow(row) {
+  setupSheets_();
+
+  const sh = sh_(TABS.SCHEDULE);
+  const id = String(row.id || row['Cycle ID'] || '').trim();
+
+  if (!id) throw new Error('Cycle ID required');
+
+  const values = sh.getDataRange().getValues();
+  let targetRow = -1;
+
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === id) targetRow = i + 1;
+  }
+
+  const data = [
+    id,
+    !!row.enabled,
+    row.startDate || '',
+    row.endDate || '',
+    row.startTime || '',
+    Number(row.durationMin || 0),
+    Number(row.minMoisture || 0),
+    Number(row.maxMoisture || 0),
+    new Date()
+  ];
+
+  if (targetRow > 0) {
+    sh.getRange(targetRow, 1, 1, data.length).setValues([data]);
+  } else {
+    sh.appendRow(data);
+  }
+
+  return {
+    ok: true,
+    schedules: scheduleArray_()
+  };
+}
+
+function deleteScheduleRow(id) {
+  setupSheets_();
+
+  const sh = sh_(TABS.SCHEDULE);
+  const values = sh.getDataRange().getValues();
+
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(id)) {
+      sh.deleteRow(i + 1);
+      return { ok: true };
+    }
+  }
+
+  return {
+    ok: false,
+    error: 'Not found'
+  };
+}
+
+function cropRows_() {
+  return rowsToObjects_(TABS.CROP);
+}
+
+function getCropRows() {
+  setupSheets_();
+  return cropRows_();
+}
+
+function saveCropTarget(row) {
+  setupSheets_();
+
+  const crop = String(row.crop || row.Crop || '').trim();
+
+  if (!crop) throw new Error('Crop required');
+
+  const sh = sh_(TABS.CROP);
+  const values = sh.getDataRange().getValues();
+  let targetRow = -1;
+
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === crop) targetRow = i + 1;
+  }
+
+  const data = [
+    crop,
+    Number(row.N || 0),
+    Number(row.P || 0),
+    Number(row.K || 0),
+    Number(row.pH || 0),
+    Number(row.EC || 0),
+    Number(row.Moisture || 0),
+    Number(row['Soil Temp'] || row.soilTemp || 0),
+    new Date()
+  ];
+
+  if (targetRow > 0) {
+    sh.getRange(targetRow, 1, 1, data.length).setValues([data]);
+  } else {
+    sh.appendRow(data);
+  }
+
+  return {
+    ok: true,
+    crops: cropRows_()
+  };
+}
+
+function getSuggestion(crop) {
+  setupSheets_();
+
+  const latest = latestNodeObject_();
+  const rows = cropRows_();
+  const target = rows.find(r => String(r.Crop).toLowerCase() === String(crop).toLowerCase());
+
+  if (!latest) return { ok: false, error: 'No Node data yet' };
+  if (!target) return { ok: false, error: 'Crop not found' };
+
+  const checks = [
+    compare_('Nitrogen', latest.nCal, target.N),
+    compare_('Phosphorus', latest.pCal, target.P),
+    compare_('Potassium', latest.kCal, target.K),
+    compare_('Soil pH', latest.phCal, target.pH),
+    compare_('Electrical Conductivity', latest.ec, target.EC),
+    compare_('Soil Moisture', latest.moistureCal, target.Moisture),
+    compare_('Soil Temperature', latest.soilTemp, target['Soil Temp'])
+  ];
+
+  return {
+    ok: true,
+    crop: crop,
+    latest: latest,
+    target: target,
+    lines: checks.map(c => c.message)
+  };
+}
+
+function compare_(name, current, target) {
+  current = Number(current);
+  target = Number(target);
+
+  if (isNaN(current) || isNaN(target)) {
+    return {
+      name: name,
+      message: name + ': data unavailable.'
+    };
+  }
+
+  const diff = current - target;
+  const pct = target === 0 ? 0 : Math.abs(diff) / Math.abs(target) * 100;
+
+  if (pct <= 10) {
+    return {
+      name: name,
+      message: name + ': OK. Current ' + current + ', target ' + target + '.'
+    };
+  }
+
+  if (diff < 0) {
+    return {
+      name: name,
+      message: name + ': low. Current ' + current + ', target ' + target + '. Consider increasing/supporting this value.'
+    };
+  }
+
+  return {
+    name: name,
+    message: name + ': high. Current ' + current + ', target ' + target + '. Avoid adding more and monitor.'
+  };
+}
+
+function getCsvData(tab, startDate, endDate, mode) {
+  setupSheets_();
+
+  tab = String(tab || '').trim();
+
+  if (tab === 'MotorLog') {
+    return getMotorLogReport(startDate, endDate, mode || 'ALL');
+  }
+
+  const sheetTab = tab === 'HubData' ? TABS.HUB : TABS.NODE;
+  const soilCalib = soilCalibrationObject_();
+
+  let rows = rowsToObjects_(sheetTab);
+
+  if (sheetTab === TABS.NODE) {
+    rows = rows.map(r => enhanceNodeRowObject_(r, soilCalib));
+  }
+
+  const s = startDate ? new Date(startDate + 'T00:00:00').getTime() : 0;
+  const e = endDate ? new Date(endDate + 'T23:59:59').getTime() : Date.now();
+
+  const filtered = rows.filter(r => {
+    const t = new Date(r.Timestamp).getTime();
+    return t >= s && t <= e;
+  });
+
+  return {
+    ok: true,
+    rows: filtered
+  };
+}
+
+function setupMotorLogOnly() {
+  const sh = sh_(TABS.MOTOR_LOG);
+
+  const header = [
+    'Date',
+    'Motor Start Time',
+    'Motor Stop Time',
+    'Interval Minute',
+    'Motor Flow Rate (L/min)',
+    'Water Used (L)',
+    'System Mode',
+    'Active Cycle',
+    'Safety Lock',
+    'Status'
+  ];
+
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+  sh.setFrozenRows(1);
+
+  const settings = settingsMap_();
+  if (!('MOTOR_FLOW_RATE_LPM' in settings)) {
+    sh_(TABS.SETTINGS).appendRow(['MOTOR_FLOW_RATE_LPM', 1, new Date()]);
+  }
+}
