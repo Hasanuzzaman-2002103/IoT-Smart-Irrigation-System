@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Farming</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root{
+      --bg:#f4f8fb;--card:#fff;--ink:#102a43;--muted:#637083;--brand:#04746f;--brand2:#0f766e;
+      --warn:#d97706;--bad:#dc2626;--ok:#059669;--line:#d7e3ea;--soft:#eef7f6;--blue:#2563eb;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--ink)}
+    header{padding:20px 24px;background:linear-gradient(120deg,#063f4d,#0f766e);color:white;box-shadow:0 4px 20px #0002}
+    header h1{margin:0;font-size:26px;letter-spacing:.2px} header p{margin:5px 0 0;color:#d9fffa}
+    .wrap{padding:18px;max-width:1440px;margin:auto}.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+    .tab{border:0;border-radius:14px;padding:10px 14px;background:white;color:#123;box-shadow:0 2px 10px #0001;cursor:pointer;font-weight:600}
+    .tab.active{background:var(--brand);color:white}.grid{display:grid;gap:14px}.g4{grid-template-columns:repeat(4,minmax(0,1fr))}.g3{grid-template-columns:repeat(3,minmax(0,1fr))}.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    @media(max-width:1000px){.g4,.g3,.g2{grid-template-columns:1fr}.row{grid-template-columns:1fr 1fr!important}}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 8px 30px #062f3b0e}.card h2,.card h3{margin:0 0 12px}.card h2{font-size:20px}.card h3{font-size:17px}
+    .metric{display:flex;align-items:center;justify-content:space-between;border-bottom:1px dashed var(--line);padding:8px 0;gap:12px}.metric:last-child{border-bottom:0}.value{font-weight:800;text-align:right}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.muted{color:var(--muted)}
+    .kpi{background:white;border:1px solid var(--line);border-radius:18px;padding:14px;box-shadow:0 6px 20px #0000000b}.kpi .label{color:var(--muted);font-size:13px}.kpi .num{font-size:26px;font-weight:850;margin-top:5px}.kpi .sub{font-size:12px;color:var(--muted);margin-top:4px}
+    input,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:12px;background:white}label{font-size:13px;color:var(--muted);display:block;margin:8px 0 5px}.btn{border:0;border-radius:12px;background:var(--brand);color:white;padding:10px 14px;cursor:pointer;margin:4px 4px 4px 0;font-weight:700}.btn.secondary{background:#334155}.btn.warn{background:var(--warn)}.btn.bad{background:var(--bad)}.btn.blue{background:var(--blue)}
+    table{width:100%;border-collapse:collapse;font-size:13px;background:white}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{background:#eef6f8;position:sticky;top:0;z-index:1}.table-wrap{max-height:460px;overflow:auto;border:1px solid var(--line);border-radius:14px}.hidden{display:none}.small{font-size:12px;color:var(--muted)}.row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e0f2fe;margin:2px;font-size:12px;font-weight:700}.pill.cal{background:#dcfce7;color:#166534}.pill.raw{background:#f1f5f9;color:#475569}.pill.lock{background:#fee2e2;color:#991b1b}.pill.run{background:#dcfce7;color:#166534}.section-title{font-weight:800;margin:16px 0 8px}.suggestion-line{padding:8px 10px;border-radius:12px;background:#f1f5f9;margin:6px 0}.panel-note{background:var(--soft);border-left:4px solid var(--brand);padding:10px;border-radius:12px;color:#164e63;margin:8px 0}
+  </style>
+</head>
+<body>
+<header>
+  <h1>Smart Farming Dashboard</h1>
+  <p>Integrated soil monitoring, irrigation control, motor log, calibration and reports</p>
+</header>
+<div class="wrap">
+  <div class="tabs">
+    <button class="tab active" onclick="showTab('dash',this)">Overview</button>
+    <button class="tab" onclick="showTab('live',this)">Live Data</button>
+    <button class="tab" onclick="showTab('control',this)">Control</button>
+    <button class="tab" onclick="showTab('settings',this)">Settings</button>
+    <button class="tab" onclick="showTab('schedule',this)">Schedule</button>
+    <button class="tab" onclick="showTab('calib',this)">Calibration</button>
+    <button class="tab" onclick="showTab('motor',this)">Motor Log</button>
+    <button class="tab" onclick="showTab('suggestion',this)">Suggestion</button>
+    <button class="tab" onclick="showTab('reports',this)">Reports</button>
+  </div>
+
+  <section id="dash" class="panel">
+    <div class="grid g4" id="kpiGrid"></div>
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card"><h3>Soil and Irrigation Summary</h3><div id="nodeSummary"></div></div>
+      <div class="card"><h3>Central Hub</h3><div id="hubSummary"></div></div>
+      <div class="card"><h3>Safety and Connectivity</h3><div id="safetySummary"></div><button class="btn" onclick="refresh()">Refresh</button></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card"><h3>Soil Moisture Trend</h3><canvas id="moistChart"></canvas></div>
+      <div class="card"><h3>Gas and Air Quality Trend</h3><canvas id="gasChart"></canvas></div>
+    </div>
+  </section>
+
+  <section id="live" class="panel hidden">
+    <div class="grid g2">
+      <div class="card"><h2>Soil Condition</h2><div id="soilDetails"></div></div>
+      <div class="card"><h2>Air and Gas Condition</h2><div id="airDetails"></div></div>
+      <div class="card"><h2>Field Node Device Status</h2><div id="deviceDetails"></div></div>
+      <div class="card"><h2>Central Hub Status</h2><div id="hubDetails"></div></div>
+    </div>
+  </section>
+
+  <section id="control" class="panel hidden">
+    <div class="grid g2">
+      <div class="card"><h2>Irrigation and Actuator Control</h2>
+        <button class="btn" onclick="sendCmd('PUMP_ON',1,'ALL')">Water / Pump ON</button>
+        <button class="btn secondary" onclick="sendCmd('PUMP_OFF',0,'ALL')">Water / Pump OFF</button>
+        <button class="btn" onclick="sendCmd('GATE_OPEN',90,'NODE1')">Gate Open Only</button>
+        <button class="btn secondary" onclick="sendCmd('GATE_CLOSE',0,'NODE1')">Gate Close Only</button>
+        <button class="btn" onclick="sendCmd('FAN_ON',1,'NODE1')">Cooling Fan ON</button>
+        <button class="btn secondary" onclick="sendCmd('FAN_OFF',0,'NODE1')">Cooling Fan OFF</button>
+        <label>Buzzer Target</label><select id="cmdTarget"><option>NODE1</option><option>HUB1</option><option>ALL</option></select>
+        <button class="btn warn" onclick="sendCmd('BUZZER_TEST',1,document.getElementById('cmdTarget').value)">Buzzer Test</button>
+        <p class="small">Water/Pump ON sends one command to both devices: HUB1 starts the pump relay and NODE1 opens the gate. ESP-side safety logic remains unchanged.</p>
+      </div>
+      <div class="card"><h2>System Mode</h2>
+        <label>Mode</label><select id="modeSelect"><option>MANUAL</option><option>AUTO</option><option>SCHEDULE</option></select>
+        <button class="btn" onclick="saveMode()">Save Mode</button>
+        <div class="panel-note">Automatic and scheduled irrigation still run from the ESP logic using the existing raw sensor values and safety margins. Dashboard calibration is for viewing, reports and suggestions only.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="settings" class="panel hidden">
+    <div class="card"><h2>System Parameters</h2><div class="row" id="settingsFields"></div><button class="btn" onclick="saveSettings()">Save Parameters</button></div>
+  </section>
+
+  <section id="schedule" class="panel hidden">
+    <div class="grid g2">
+      <div class="card"><h2>Add / Edit Cycle</h2>
+        <label>Cycle ID</label><input id="cyId" value="Cycle-1">
+        <label>Enabled</label><select id="cyEnabled"><option value="true">TRUE</option><option value="false">FALSE</option></select>
+        <label>Start Date</label><input id="cyStart" type="date">
+        <label>End Date</label><input id="cyEnd" type="date">
+        <label>Start Time</label><input id="cyTime" type="time" value="06:30">
+        <label>Duration Minute</label><input id="cyDur" type="number" value="20">
+        <label>Min Moisture</label><input id="cyMin" type="number" value="35">
+        <label>Max Moisture</label><input id="cyMax" type="number" value="70">
+        <button class="btn" onclick="saveCycle()">Save Cycle</button>
+      </div>
+      <div class="card"><h2>Saved Cycles</h2><div id="scheduleTable"></div></div>
+    </div>
+  </section>
+
+  <section id="calib" class="panel hidden">
+    <div class="grid g2">
+      <div class="card"><h2>Gas Calibration</h2><p class="small">Maps raw gas-channel reading to known PPM. These values are still compatible with the existing ESP gas calibration system.</p><div id="gasCalibTable"></div><button class="btn" onclick="saveGasCalib()">Save Gas Calibration</button></div>
+      <div class="card"><h2>Soil Sensor Calibration</h2><p class="small">Dashboard-only calibration. If at least two valid calibration points are entered for a parameter, the dashboard shows the calculated value. Otherwise it shows the raw sensor value.</p><div id="soilCalibTable"></div><button class="btn" onclick="saveSoilCalib()">Save Soil Calibration</button></div>
+    </div>
+  </section>
+
+  <section id="motor" class="panel hidden">
+    <div class="card"><h2>Motor Usage Log</h2>
+      <div class="row">
+        <div><label>Start Date</label><input id="motorStart" type="date"></div>
+        <div><label>End Date</label><input id="motorEnd" type="date"></div>
+        <div><label>Mode</label><select id="motorMode"><option>ALL</option><option>MANUAL</option><option>AUTO</option><option>SCHEDULE</option></select></div>
+        <div><label>&nbsp;</label><button class="btn" onclick="searchMotorLog()">Search</button><button class="btn secondary" onclick="setMotorLastMonths(2)">Last 2 Months</button></div>
+      </div>
+      <div id="motorSummary" class="grid g3" style="margin-top:12px"></div>
+      <button class="btn blue" onclick="downloadMotorCsv()">Download Motor Log CSV</button>
+      <div id="motorTable" style="margin-top:12px"></div>
+    </div>
+  </section>
+
+  <section id="suggestion" class="panel hidden">
+    <div class="grid g2">
+      <div class="card"><h2>Set Crop Values</h2>
+        <label>Crop</label><select id="cropSet"><option>Rice</option><option>Potato</option><option>Tomato</option></select>
+        <div class="row">
+          <div><label>Nitrogen</label><input id="cropN" type="number"></div><div><label>Phosphorus</label><input id="cropP" type="number"></div><div><label>Potassium</label><input id="cropK" type="number"></div><div><label>Soil pH</label><input id="cropPH" type="number" step="0.1"></div>
+          <div><label>Electrical Conductivity</label><input id="cropEC" type="number"></div><div><label>Soil Moisture</label><input id="cropM" type="number"></div><div><label>Soil Temperature</label><input id="cropT" type="number"></div>
+        </div>
+        <button class="btn" onclick="saveCrop()">Save Crop Values</button>
+      </div>
+      <div class="card"><h2>Crop Suggestion</h2>
+        <label>Crop</label><select id="cropSuggest"><option>Rice</option><option>Potato</option><option>Tomato</option></select>
+        <button class="btn" onclick="loadSuggestion()">Show Suggestion</button><div id="suggestionOut"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="reports" class="panel hidden">
+    <div class="card"><h2>Date-to-Date Report</h2>
+      <div class="row"><div><label>Data Type</label><select id="reportTab"><option>NodeData</option><option>HubData</option><option>MotorLog</option></select></div><div><label>Start Date</label><input id="reportStart" type="date"></div><div><label>End Date</label><input id="reportEnd" type="date"></div><div><label>Motor Mode Filter</label><select id="reportMode"><option>ALL</option><option>MANUAL</option><option>AUTO</option><option>SCHEDULE</option></select></div></div>
+      <button class="btn" onclick="previewReport()">Preview</button><button class="btn blue" onclick="downloadReportCsv()">Download CSV</button>
+      <div id="reportPreview" style="margin-top:12px"></div>
+    </div>
+  </section>
+</div>
+<script>
+let state = { data:null, charts:{}, gasRows:[], soilRows:[], motorRows:[], reportRows:[] };
+let editing = false;
+let activeTab = 'dash';
+const settingKeys = ['MAX_METHANE','MAX_CO','MAX_CO2','MIN_MOISTURE','MAX_MOISTURE','MIN_TEMP','MAX_TEMP','NODE_RELAY_OFF_V','NODE_RELAY_ON_V','NODE_DATA_STALE_SEC','MOTOR_FLOW_RATE_LPM','MODE'];
+const settingLabels = {MAX_METHANE:'Max Methane',MAX_CO:'Max Carbon Monoxide',MAX_CO2:'Max CO2 / Air Quality',MIN_MOISTURE:'Min Soil Moisture',MAX_MOISTURE:'Max Soil Moisture',MIN_TEMP:'Min Temperature',MAX_TEMP:'Max Temperature',NODE_RELAY_OFF_V:'Node Low Battery Cutoff',NODE_RELAY_ON_V:'Node Recovery Voltage',NODE_DATA_STALE_SEC:'Node Data Stale Time (sec)',MOTOR_FLOW_RATE_LPM:'Motor Flow Rate (L/min)',MODE:'System Mode'};
+const gasLabels = {MQ4:'Methane Level',MQ9:'Carbon Monoxide Level',MQ135:'Carbon Dioxide / Air Quality'};
+const soilMeta = {MOISTURE:{label:'Soil Moisture',unit:'%',points:10},N:{label:'Nitrogen',unit:'mg/kg',points:5},P:{label:'Phosphorus',unit:'mg/kg',points:5},K:{label:'Potassium',unit:'mg/kg',points:5},PH:{label:'Soil pH',unit:'pH',points:5}};
+
+function showTab(id, btn){
+  activeTab=id;
+  document.querySelectorAll('.panel').forEach(p=>p.classList.add('hidden'));
+  document.getElementById(id).classList.remove('hidden');
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  btn.classList.add('active');
+  if(id==='motor' && !state.motorRows.length) searchMotorLog();
+  if(id==='calib') loadCalibrationRows();
+}
+function esc(s){ return String(s ?? '').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+function fmt(v, unit=''){ if(v===null || v===undefined || v==='') return 'Null'; const n=Number(v); return isNaN(n) ? esc(v) : (Math.round(n*100)/100)+unit; }
+function badge(isCal){ return isCal ? '<span class="pill cal">calibrated</span>' : '<span class="pill raw">raw</span>'; }
+function metric(k,v,cls=''){ return `<div class="metric"><span>${k}</span><span class="value ${cls}">${v ?? 'Null'}</span></div>`; }
+function kpi(label, num, sub='', cls=''){ return `<div class="kpi"><div class="label">${label}</div><div class="num ${cls}">${num}</div><div class="sub">${sub}</div></div>`; }
+function todayISO(){ return new Date().toISOString().slice(0,10); }
+function daysAgoISO(days){ const d=new Date(); d.setDate(d.getDate()-days); return d.toISOString().slice(0,10); }
+
+function refresh(){ google.script.run.withSuccessHandler(render).withFailureHandler(err=>alert(err.message)).getDashboardData(3); }
+function render(data){
+  state.data=data;
+  const n=data.latestNode||{}; const s=data.settings||{}; const latestHub=(data.hubRows||[]).slice(-1)[0]||{}; const mt=data.motorToday||{};
+  const methaneBad=Number(n.methane)>=Number(s.MAX_METHANE||999999); const stale=Number(n.ageSec)>Number(s.NODE_DATA_STALE_SEC||150);
+  const pumpState=latestHub['Pump State'] || 'Null';
+  const safety=latestHub['Safety Lock'] || (methaneBad?'METHANE LOCK':(stale?'NODE STALE':'OK'));
+
+  document.getElementById('kpiGrid').innerHTML =
+    kpi('Soil Moisture', fmt(n.moistureCal,'%'), n.moistureIsCalibrated?'calibrated from NPK':'raw from NPK')+
+    kpi('Pump State', esc(pumpState), 'Central Hub motor relay', pumpState==='ON'?'ok':'')+
+    kpi('Today Motor Time', fmt(mt.totalIntervalMin,' min'), 'from MotorLog')+
+    kpi('Today Water Used', fmt(mt.totalWaterUsedL,' L'), 'flow rate × run time');
+
+  document.getElementById('nodeSummary').innerHTML =
+    metric('Soil Moisture', fmt(n.moistureCal,'%')+' '+badge(n.moistureIsCalibrated))+
+    metric('Soil pH', fmt(n.phCal)+' '+badge(n.phIsCalibrated))+
+    metric('Nitrogen', fmt(n.nCal)+' '+badge(n.nIsCalibrated))+
+    metric('Phosphorus', fmt(n.pCal)+' '+badge(n.pIsCalibrated))+
+    metric('Potassium', fmt(n.kCal)+' '+badge(n.kIsCalibrated))+
+    metric('Gate Position', fmt(n.gate,'°'));
+
+  document.getElementById('hubSummary').innerHTML =
+    metric('Pump State', esc(pumpState), pumpState==='ON'?'ok':'')+
+    metric('Relay State', esc(latestHub['Relay State']))+
+    metric('Hub Battery', fmt(latestHub['Battery Voltage'],' V'))+
+    metric('System Mode', esc(s.MODE))+
+    metric('Active Cycle', esc(latestHub['Active Cycle'] || 'None'));
+
+  document.getElementById('safetySummary').innerHTML =
+    metric('Methane Safety', methaneBad?'LOCKED':'Safe', methaneBad?'bad':'ok')+
+    metric('Node Data', stale?'STALE':'Fresh', stale?'warn':'ok')+
+    metric('Current Safety State', esc(safety), safety==='OK'?'ok':'warn')+
+    metric('Last Update Age', fmt(n.ageSec,' sec'))+
+    metric('WiFi Signal', fmt(n.rssi,' dBm'));
+
+  renderLiveData(n, latestHub); renderSettings(s); renderSchedule(data.schedules||[]); renderCharts(data.nodeRows||[]); fillCropDefaults(data.crops||[]);
+  if(activeTab==='calib' && !editing) loadCalibrationRows();
+}
+function renderLiveData(n, h){
+  document.getElementById('soilDetails').innerHTML =
+    metric('Soil Moisture', fmt(n.moistureCal,'%')+' '+badge(n.moistureIsCalibrated))+metric('Raw Soil Moisture', fmt(n.moisture,'%'))+
+    metric('Soil Temperature', fmt(n.soilTemp,' °C'))+metric('Electrical Conductivity', fmt(n.ec))+metric('Soil pH', fmt(n.phCal)+' '+badge(n.phIsCalibrated))+metric('Raw pH', fmt(n.ph))+
+    metric('Nitrogen', fmt(n.nCal)+' '+badge(n.nIsCalibrated))+metric('Phosphorus', fmt(n.pCal)+' '+badge(n.pIsCalibrated))+metric('Potassium', fmt(n.kCal)+' '+badge(n.kIsCalibrated));
+  document.getElementById('airDetails').innerHTML =
+    metric('Methane Level', fmt(n.methane))+metric('Carbon Monoxide Level', fmt(n.co))+metric('Carbon Dioxide / Air Quality', fmt(n.co2))+metric('Temperature', fmt(n.airTemp,' °C'))+metric('Humidity', fmt(n.humidity,'%'));
+  document.getElementById('deviceDetails').innerHTML =
+    metric('Field Node Battery', fmt(n.batt,' V'))+metric('Gate Position', fmt(n.gate,'°'))+metric('Sensor Relay', esc(n.relay))+metric('Cooling Fan', esc(n.fan))+metric('Node WiFi Signal', fmt(n.rssi,' dBm'))+metric('Node Status', esc(n.status))+metric('Last Node Update', esc(n.timestamp));
+  document.getElementById('hubDetails').innerHTML = Object.entries(h||{}).map(([k,v])=>metric(esc(k),esc(v))).join('') || '<p class="small">No hub data yet.</p>';
+}
+function renderSettings(s){
+  if (editing && (activeTab==='control' || activeTab==='settings')) return;
+  const root=document.getElementById('settingsFields');
+  root.innerHTML=settingKeys.map(k=>`<div><label>${settingLabels[k]||k}</label><input id="set_${k}" value="${esc(s[k]??'')}"></div>`).join('');
+  document.getElementById('modeSelect').value=String(s.MODE||'AUTO').toUpperCase();
+}
+function saveSettings(){ const obj={}; settingKeys.forEach(k=>obj[k]=document.getElementById('set_'+k).value); google.script.run.withSuccessHandler(()=>{alert('Saved');refresh();}).withFailureHandler(e=>alert(e.message)).saveSettings(obj); }
+function saveMode(){ const mode=document.getElementById('modeSelect').value; google.script.run.withSuccessHandler(()=>{ google.script.run.withSuccessHandler(r=>{alert('Mode saved and command sent: '+r.command.id); editing=false; refresh();}).sendCommand({target:'ALL',cmd:'SET_MODE',value:mode}); }).saveSettings({MODE:mode}); }
+function sendCmd(cmd,value,target){ target = target || 'ALL'; google.script.run.withSuccessHandler(r=>alert('Command sent: '+r.command.id+' to '+r.command.target)).withFailureHandler(e=>alert(e.message)).sendCommand({target,cmd,value}); }
+
+function renderSchedule(rows){ document.getElementById('scheduleTable').innerHTML='<div class="table-wrap"><table><tr><th>ID</th><th>Enabled</th><th>Date</th><th>Time</th><th>Duration</th><th>Moisture</th><th></th></tr>'+rows.map(r=>`<tr><td>${esc(r.id)}</td><td>${r.enabled}</td><td>${esc(r.startDate)} to ${esc(r.endDate)}</td><td>${esc(r.startTime)}</td><td>${r.durationMin}</td><td>${r.minMoisture}-${r.maxMoisture}</td><td><button class="btn bad" onclick="deleteCycle('${esc(r.id)}')">Delete</button></td></tr>`).join('')+'</table></div>'; }
+function saveCycle(){ const row={id:cyId.value, enabled:cyEnabled.value==='true', startDate:cyStart.value, endDate:cyEnd.value, startTime:cyTime.value, durationMin:cyDur.value, minMoisture:cyMin.value, maxMoisture:cyMax.value}; google.script.run.withSuccessHandler(()=>{alert('Cycle saved');refresh();}).withFailureHandler(e=>alert(e.message)).saveScheduleRow(row); }
+function deleteCycle(id){ if(confirm('Delete '+id+'?')) google.script.run.withSuccessHandler(refresh).deleteScheduleRow(id); }
+
+function loadCalibrationRows(){ loadGasCalibRows(); loadSoilCalibRows(); }
+function loadGasCalibRows(){ google.script.run.withSuccessHandler(rows=>{ state.gasRows=rows; let html='<div class="table-wrap"><table><tr><th>Gas Parameter</th><th>Point</th><th>Raw Reading</th><th>Known PPM</th></tr>'; ['MQ4','MQ9','MQ135'].forEach(sensor=>{ for(let p=1;p<=5;p++){ const r=rows.find(x=>String(x.Sensor).toUpperCase()===sensor&&Number(x.PointIndex)===p)||{}; html+=`<tr><td>${gasLabels[sensor]}</td><td>${p}</td><td><input class="calRaw" data-s="${sensor}" data-p="${p}" value="${esc(r.RawValue??'')}"></td><td><input class="calPpm" data-s="${sensor}" data-p="${p}" value="${esc(r.PPMValue??'')}"></td></tr>`; }}); html+='</table></div>'; document.getElementById('gasCalibTable').innerHTML=html; }).getCalibrationRows(); }
+function saveGasCalib(){ const rows=[]; document.querySelectorAll('.calRaw').forEach(inp=>{ const s=inp.dataset.s,p=inp.dataset.p; const ppm=document.querySelector(`.calPpm[data-s="${s}"][data-p="${p}"]`).value; rows.push({sensor:s,point:p,raw:inp.value,ppm}); }); google.script.run.withSuccessHandler(()=>{alert('Gas calibration saved'); refresh();}).withFailureHandler(e=>alert(e.message)).saveCalibration(rows); }
+function loadSoilCalibRows(){ google.script.run.withSuccessHandler(rows=>{ state.soilRows=rows; let html='<div class="table-wrap"><table><tr><th>Parameter</th><th>Point</th><th>Sensor Value</th><th>Actual Tested Value</th><th>Unit</th></tr>'; Object.keys(soilMeta).forEach(param=>{ const meta=soilMeta[param]; for(let p=1;p<=meta.points;p++){ const r=rows.find(x=>String(x.Parameter).toUpperCase()===param&&Number(x.PointIndex)===p)||{}; html+=`<tr><td>${meta.label}</td><td>${p}</td><td><input class="soilSensor" data-param="${param}" data-p="${p}" data-unit="${meta.unit}" value="${esc(r.SensorValue??'')}"></td><td><input class="soilActual" data-param="${param}" data-p="${p}" value="${esc(r.ActualValue??'')}"></td><td>${meta.unit}</td></tr>`; }}); html+='</table></div>'; document.getElementById('soilCalibTable').innerHTML=html; }).getSoilCalibrationRows(); }
+function saveSoilCalib(){ const rows=[]; document.querySelectorAll('.soilSensor').forEach(inp=>{ const param=inp.dataset.param,p=inp.dataset.p,unit=inp.dataset.unit; const actual=document.querySelector(`.soilActual[data-param="${param}"][data-p="${p}"]`).value; rows.push({parameter:param,point:p,sensor:inp.value,actual,unit}); }); google.script.run.withSuccessHandler(()=>{alert('Soil calibration saved'); refresh();}).withFailureHandler(e=>alert(e.message)).saveSoilCalibration(rows); }
+
+function fillCropDefaults(rows){ if(!rows.length)return; const c=document.getElementById('cropSet').value; const r=rows.find(x=>x.Crop===c)||rows[0]; cropN.value=r.N||''; cropP.value=r.P||''; cropK.value=r.K||''; cropPH.value=r.pH||''; cropEC.value=r.EC||''; cropM.value=r.Moisture||''; cropT.value=r['Soil Temp']||''; }
+document.getElementById('cropSet').addEventListener('change',()=>fillCropDefaults((state.data||{}).crops||[]));
+function saveCrop(){ google.script.run.withSuccessHandler(()=>{alert('Crop values saved');refresh();}).withFailureHandler(e=>alert(e.message)).saveCropTarget({crop:cropSet.value,N:cropN.value,P:cropP.value,K:cropK.value,pH:cropPH.value,EC:cropEC.value,Moisture:cropM.value,soilTemp:cropT.value}); }
+function loadSuggestion(){ google.script.run.withSuccessHandler(r=>{ suggestionOut.innerHTML = r.ok ? r.lines.map(x=>`<div class="suggestion-line">${esc(x)}</div>`).join('') : `<p class="bad">${esc(r.error)}</p>`; }).getSuggestion(cropSuggest.value); }
+
+function renderCharts(rows){ const labels=rows.map(r=>String(r.Timestamp).slice(5,16)); const mois=rows.map(r=>Number(r['Soil Moisture Display']||r['Soil Moisture']||0)); const methane=rows.map(r=>Number(r['Methane Level']||0)); const co=rows.map(r=>Number(r['CO Level']||0)); const co2=rows.map(r=>Number(r['CO2 Equivalent']||0)); makeChart('moistChart',labels,[{label:'Soil Moisture',data:mois}]); makeChart('gasChart',labels,[{label:'Methane',data:methane},{label:'Carbon Monoxide',data:co},{label:'CO2 / Air Quality',data:co2}]); }
+function makeChart(id,labels,datasets){ if(state.charts[id]) state.charts[id].destroy(); state.charts[id]=new Chart(document.getElementById(id),{type:'line',data:{labels,datasets},options:{responsive:true,animation:false,plugins:{legend:{display:true}}}}); }
+
+function setMotorLastMonths(months){ const end=new Date(); const start=new Date(); start.setMonth(start.getMonth()-months); document.getElementById('motorStart').value=start.toISOString().slice(0,10); document.getElementById('motorEnd').value=end.toISOString().slice(0,10); searchMotorLog(); }
+function searchMotorLog(){ const s=motorStart.value,e=motorEnd.value,m=motorMode.value; google.script.run.withSuccessHandler(renderMotorLog).withFailureHandler(err=>alert(err.message)).getMotorLogReport(s,e,m); }
+function renderMotorLog(res){ state.motorRows=res.rows||[]; const sum=res.summary||{}; document.getElementById('motorSummary').innerHTML=kpi('Total Motor ON Time',fmt(sum.totalIntervalMin,' min'),'selected range')+kpi('Total Water Used',fmt(sum.totalWaterUsedL,' L'),'selected range')+kpi('Motor Cycles',fmt(sum.cycles),'selected range'); document.getElementById('motorTable').innerHTML=tableFromRows(state.motorRows, ['Date','Motor Start Time','Motor Stop Time','Interval Minute','Motor Flow Rate (L/min)','Water Used (L)','System Mode','Active Cycle','Safety Lock','Status']); }
+function downloadMotorCsv(){ if(!state.motorRows.length){ searchMotorLog(); setTimeout(()=>downloadRowsAsCsv(state.motorRows,'MotorLog.csv'),700); } else downloadRowsAsCsv(state.motorRows,'MotorLog.csv'); }
+
+function previewReport(){ const tab=reportTab.value,s=reportStart.value,e=reportEnd.value,m=reportMode.value; google.script.run.withSuccessHandler(r=>{ state.reportRows=r.rows||[]; const extra=r.summary?('<div class="grid g3" style="margin:10px 0">'+kpi('Total Time',fmt(r.summary.totalIntervalMin,' min'))+kpi('Water Used',fmt(r.summary.totalWaterUsedL,' L'))+kpi('Cycles',fmt(r.summary.cycles))+'</div>'):''; reportPreview.innerHTML=extra+tableFromRows(state.reportRows, null, 80); }).withFailureHandler(err=>alert(err.message)).getCsvData(tab,s,e,m); }
+function downloadReportCsv(){ if(!state.reportRows.length){ previewReport(); setTimeout(()=>downloadRowsAsCsv(state.reportRows,reportTab.value+'.csv'),800); } else downloadRowsAsCsv(state.reportRows,reportTab.value+'.csv'); }
+function tableFromRows(rows, keys, limit){ rows=rows||[]; if(!rows.length)return '<p class="small">No data found.</p>'; keys=keys||Object.keys(rows[0]); const show=limit?rows.slice(0,limit):rows; return '<div class="table-wrap"><table><tr>'+keys.map(k=>`<th>${esc(k)}</th>`).join('')+'</tr>'+show.map(r=>'<tr>'+keys.map(k=>`<td>${esc(r[k]??'')}</td>`).join('')+'</tr>').join('')+'</table></div>'+(limit&&rows.length>limit?`<p class="small">Showing first ${limit} of ${rows.length} rows.</p>`:''); }
+function downloadRowsAsCsv(rows,filename){ rows=rows||[]; if(!rows.length)return alert('No rows to download'); const keys=Object.keys(rows[0]); const csv=[keys.join(',')].concat(rows.map(row=>keys.map(k=>'"'+String(row[k]??'').replace(/"/g,'""')+'"').join(','))).join('\n'); const blob=new Blob([csv],{type:'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename; a.click(); }
+
+document.addEventListener('focusin', e => { if (e.target.matches('input,select,textarea')) editing = true; });
+document.addEventListener('focusout', e => { if (e.target.matches('input,select,textarea')) setTimeout(()=>editing=false, 800); });
+function initDates(){ motorStart.value=daysAgoISO(30); motorEnd.value=todayISO(); reportStart.value=daysAgoISO(30); reportEnd.value=todayISO(); }
+initDates(); refresh(); setInterval(()=>{ if(!editing) refresh(); },30000);
+</script>
+</body>
+</html>
